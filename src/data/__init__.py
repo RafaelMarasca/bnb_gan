@@ -5,6 +5,7 @@ Dataset generation, serialization, and experiment orchestration.
 """
 
 from .generator import DatasetGenerator, DatasetSample
+from .nn_dataset import NNDatasetGenerator, RadComHDF5Dataset
 from .experiments import (
     ConvergenceResult,
     RateVsEpsilonResult,
@@ -15,6 +16,8 @@ from .experiments import (
 __all__ = [
     "DatasetGenerator",
     "DatasetSample",
+    "NNDatasetGenerator",
+    "RadComHDF5Dataset",
     "ConvergenceResult",
     "RateVsEpsilonResult",
     "run_convergence_experiment",

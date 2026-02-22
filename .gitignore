@@ -33,6 +33,7 @@ Desktop.ini
 figures/*.png
 figures/*.eps
 datasets/*.h5
+nn_datasets/*.h5
 
 # Logs
 *.log
