@@ -155,6 +155,93 @@ samples, metadata = DatasetGenerator.load_hdf5(path)
 
 ---
 
+## Running Experiments
+
+The experiment pipeline lets you run the full system end-to-end or execute individual stages. Results (waveforms, figures, reports) are saved to `results/`.
+
+### Full pipeline (quick test)
+
+```bash
+python run.py run --preset quick
+```
+
+This runs all 7 stages — convergence, rate_sweep, dataset, gan_train, waveform_eval, plots, report — and writes everything to `results/quick_test/`.
+
+### Full pipeline (paper parameters)
+
+```bash
+python run.py run --preset paper
+```
+
+Uses the paper's default parameters (N=16, K=4, L=20).
+
+### Run specific stages only
+
+```bash
+python run.py run --preset quick --stages convergence rate_sweep plots
+```
+
+### Override parameters from CLI
+
+```bash
+python run.py run --preset quick --N 16 --K 4 --gan-epochs 50 --eval-n-samples 10
+```
+
+### Parameter sweep
+
+```bash
+# Sweep over antenna count and users
+python run.py sweep --preset quick --axis N=8,16,32 --axis K=2,4
+
+# Or from a JSON file
+python run.py sweep --preset quick --grid sweep_grid.json
+```
+
+### Generate reports
+
+```bash
+# Single experiment report
+python run.py report results/quick_test
+
+# Comparison across all experiments in a directory
+python run.py report results/ --compare
+```
+
+### Shortcut via `python -m src`
+
+```bash
+python -m src --preset quick
+python -m src --preset paper --stages convergence rate_sweep plots
+```
+
+### Output structure
+
+```
+results/quick_test/
+├── config.json                  # Full experiment config
+├── report.md                    # Auto-generated Markdown report
+├── figures/                     # All plots (PNG)
+│   ├── convergence.png
+│   ├── rate_vs_epsilon.png
+│   ├── gan_training.png
+│   ├── eval_rate_comparison.png
+│   └── ...
+├── waveforms/                   # Complete waveform data per sample
+│   ├── sample_0000.npz          # H, S, X0, X_bnb, X_gan, rates, metrics
+│   ├── sample_0001.npz
+│   └── summary.json
+├── stages/                      # Per-stage artifacts
+│   ├── convergence/
+│   ├── rate_sweep/
+│   ├── dataset/
+│   └── gan_train/
+└── checkpoints/                 # GAN model checkpoints
+```
+
+Each `sample_XXXX.npz` contains: `H`, `S`, `X0`, `X_bnb`, `X_gan`, `epsilon`, `rate_bnb`, `rate_gan`, `power_bnb`, `power_gan`, `l2_bnb`, `l2_gan`, `feasible_bnb`, `feasible_gan`.
+
+---
+
 ## Reproducing Paper Figures
 
 ### Option 1: Jupyter Notebook

@@ -35,6 +35,9 @@ figures/*.eps
 datasets/*.h5
 nn_datasets/*.h5
 
+# Experiment results
+results/
+
 # GAN checkpoints
 checkpoints/*.pt
 checkpoints/**
