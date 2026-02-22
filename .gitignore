@@ -35,5 +35,9 @@ figures/*.eps
 datasets/*.h5
 nn_datasets/*.h5
 
+# GAN checkpoints
+checkpoints/*.pt
+checkpoints/**
+
 # Logs
 *.log
