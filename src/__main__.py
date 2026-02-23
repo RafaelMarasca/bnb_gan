@@ -1,48 +1,37 @@
 """
 Entry point for ``python -m src``.
 
-Quick shortcut — runs the pipeline with a preset config.
+Delegates to the unified CLI in ``main.py``.
 
 Usage
 -----
 ::
 
-    python -m src --preset quick
-    python -m src --preset paper --stages convergence rate_sweep plots
+    python -m src --mode generate --config configs/quick.yaml
+    python -m src --mode train    --config configs/quick.yaml
+    python -m src --mode evaluate --config configs/quick.yaml
+    python -m src experiment --list
+    python -m src pipeline --preset quick
 
-For the full CLI with subcommands (run, sweep, report)::
+For the full CLI help::
 
-    python run.py --help
+    python -m src --help
 """
 
 from __future__ import annotations
 
-import argparse
 import sys
+from pathlib import Path
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(
-        prog="python -m src",
-        description="RadCom Pipeline (shortcut). Use run.py for full CLI.",
-    )
-    p.add_argument("--preset", choices=["quick", "paper"], default="quick",
-                   help="Config preset (default: quick)")
-    p.add_argument("--stages", nargs="+", default=None,
-                   help="Stages to run (space-separated)")
-    p.add_argument("--quiet", action="store_true")
-    args = p.parse_args()
+    # Ensure the project root is on sys.path so ``main.py`` imports work
+    root = Path(__file__).resolve().parent.parent
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
 
-    from .experiments.config import ExperimentConfig
-    from .experiments.runner import ExperimentRunner
-
-    cfg = (ExperimentConfig.quick_test() if args.preset == "quick"
-           else ExperimentConfig.paper())
-    if args.stages:
-        cfg = cfg.with_overrides(stages=args.stages)
-
-    runner = ExperimentRunner(cfg)
-    runner.run(verbose=not args.quiet)
+    from main import main as cli_main
+    cli_main()
 
 
 if __name__ == "__main__":

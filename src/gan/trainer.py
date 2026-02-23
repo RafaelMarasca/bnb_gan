@@ -39,6 +39,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
 from .networks import Generator, Critic
 from .history import TrainingHistory
@@ -253,7 +254,13 @@ class WGANGPTrainer:
         t0 = time.time()
         total_critic_steps = 0
 
-        for epoch in range(self.cfg.n_epochs):
+        epoch_pbar = tqdm(
+            range(self.cfg.n_epochs),
+            desc="Training",
+            unit="epoch",
+            disable=not verbose,
+        )
+        for epoch in epoch_pbar:
             ep_critic_loss = 0.0
             ep_gen_loss = 0.0
             ep_w_dist = 0.0
@@ -268,7 +275,14 @@ class WGANGPTrainer:
             ep_rate_fake = 0.0
             n_physics = 0
 
-            for batch_idx, (cond, X_real, X0_real, eps_batch, rate_batch) in enumerate(loader):
+            batch_pbar = tqdm(
+                loader,
+                desc=f"  Epoch {epoch+1:>{len(str(self.cfg.n_epochs))}}/{self.cfg.n_epochs}",
+                unit="batch",
+                leave=False,
+                disable=not verbose,
+            )
+            for batch_idx, (cond, X_real, X0_real, eps_batch, rate_batch) in enumerate(batch_pbar):
                 cond = cond.to(self.device)
                 X_real = X_real.to(self.device)
                 X0_real = X0_real.to(self.device)
@@ -349,19 +363,14 @@ class WGANGPTrainer:
             }
             self.history.record(**record)
 
-            if verbose:
-                elapsed = time.time() - t0
-                print(
-                    f"Epoch {epoch:>4d}/{self.cfg.n_epochs} | "
-                    f"C_loss={record['critic_loss']:+.4f}  "
-                    f"G_loss={record['generator_loss']:+.4f}  "
-                    f"W_dist={record['wasserstein_dist']:.4f}  "
-                    f"GP={record['gradient_penalty']:.4f}  "
-                    f"rate_real={record['rate_real']:.3f}  "
-                    f"rate_fake={record['rate_fake']:.3f}  "
-                    f"pwr_viol={record['power_violation']:.4f}  "
-                    f"({elapsed:.0f}s)"
-                )
+            # Update epoch progress bar postfix with key metrics
+            epoch_pbar.set_postfix({
+                "C": f"{record['critic_loss']:+.3f}",
+                "G": f"{record['generator_loss']:+.3f}",
+                "W": f"{record['wasserstein_dist']:.3f}",
+                "r_real": f"{record['rate_real']:.2f}",
+                "r_fake": f"{record['rate_fake']:.2f}",
+            })
 
             # --- Checkpoint ---
             if self.cfg.save_every > 0 and (epoch + 1) % self.cfg.save_every == 0:

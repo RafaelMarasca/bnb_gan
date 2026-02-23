@@ -36,7 +36,9 @@ Usage
 from __future__ import annotations
 
 import json
+import os
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -44,10 +46,47 @@ from typing import Sequence
 import h5py
 import numpy as np
 from numpy.typing import NDArray
+from tqdm import tqdm
 
 from ..signal_proc.waveform import generate_channel, generate_chirp, generate_symbols
 from ..utils.config import BnBConfig, SystemConfig
 from ..optimizer.waveform_optimizer import WaveformMatrixOptimizer
+
+
+# =====================================================================
+# Worker function (top-level so it can be pickled by multiprocessing)
+# =====================================================================
+
+def _generate_one_sample(
+    args: tuple,
+) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
+    """Generate a single (H, S, X0, X_opt, eps, rate) sample.
+
+    Parameters
+    ----------
+    args : tuple
+        (idx, seed, eps_val, sys_config, bnb_config, X0)
+        Packed as a single tuple for ``ProcessPoolExecutor.map``.
+
+    Returns
+    -------
+    tuple
+        (idx, H, S, X0, X_opt, eps_val, sum_rate)
+    """
+    idx, seed, eps_val, sys_config, bnb_config, X0 = args
+
+    # Import inside worker so each process bootstraps independently
+    from ..metrics.rate import sum_rate as _sum_rate
+
+    np.random.seed(seed + idx)
+    H = generate_channel(sys_config.K, sys_config.N)
+    S = generate_symbols(sys_config.K, sys_config.L)
+
+    optimizer = WaveformMatrixOptimizer(sys_config, bnb_config)
+    X_opt, _ = optimizer.optimize(H, S, X0, eps_val)
+    sr = _sum_rate(H, X_opt, S, sys_config.N0)
+
+    return (idx, H, S, X0, X_opt, eps_val, sr)
 
 
 # =====================================================================
@@ -96,6 +135,7 @@ class NNDatasetGenerator:
         seed: int = 0,
         filename: str | None = None,
         verbose: bool = True,
+        n_workers: int = 1,
     ) -> Path:
         """Generate *n_samples* and stream them to an HDF5 file.
 
@@ -117,14 +157,16 @@ class NNDatasetGenerator:
             timestamp and sample count.
         verbose : bool
             Print chunk-level progress.
+        n_workers : int
+            Number of parallel worker processes.  ``1`` = sequential
+            (default).  ``0`` = use all available CPU cores.
+            Values > 1 spawn that many processes.
 
         Returns
         -------
         Path
             Absolute path to the saved HDF5 file.
         """
-        from ..metrics.rate import sum_rate as _sum_rate
-
         cfg = self.sys_config
         eps_list = [epsilons] if isinstance(epsilons, (int, float)) else list(epsilons)
 
@@ -133,8 +175,15 @@ class NNDatasetGenerator:
             filename = f"radcom_N{cfg.N}_K{cfg.K}_L{cfg.L}_{n_samples}samples_{ts}.h5"
 
         path = self.output_dir / filename
-        optimizer = WaveformMatrixOptimizer(cfg, self.bnb_config)
         X0 = generate_chirp(cfg.N, cfg.L, cfg.PT)
+
+        # Resolve worker count
+        if n_workers == 0:
+            n_workers = os.cpu_count() or 1
+        use_parallel = n_workers > 1
+
+        if verbose and use_parallel:
+            print(f"  Parallel generation with {n_workers} workers")
 
         t0 = time.time()
         written = 0
@@ -172,6 +221,7 @@ class NNDatasetGenerator:
             meta.attrs["epsilons"] = json.dumps(eps_list)
             meta.attrs["seed"] = seed
             meta.attrs["chunk_size"] = self.chunk_size
+            meta.attrs["n_workers"] = n_workers
             meta.attrs["creation_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
             meta.attrs["sys_config"] = json.dumps({
                 "N": cfg.N, "K": cfg.K, "L": cfg.L,
@@ -187,9 +237,128 @@ class NNDatasetGenerator:
             })
 
             # --- Generate in chunks ---
+            pbar = tqdm(
+                total=n_samples,
+                desc="Generating dataset",
+                unit="sample",
+                disable=not verbose,
+            )
+
+            if use_parallel:
+                self._generate_parallel(
+                    f, ds_H, ds_S, ds_X0, ds_Xopt, ds_eps, ds_rate,
+                    n_samples, eps_list, seed, X0, n_workers, pbar,
+                )
+            else:
+                self._generate_sequential(
+                    f, ds_H, ds_S, ds_X0, ds_Xopt, ds_eps, ds_rate,
+                    n_samples, eps_list, seed, X0, pbar,
+                )
+
+            pbar.close()
+            written = ds_H.shape[0]
+
+            # --- Finalize metadata ---
+            meta.attrs["n_samples"] = written
+            meta.attrs["total_time_s"] = time.time() - t0
+
+        if verbose:
+            sz_mb = path.stat().st_size / (1024 * 1024)
+            elapsed = time.time() - t0
+            print(f"\n  Dataset saved: {path.resolve()}")
+            print(f"  {written} samples, {sz_mb:.1f} MB, {elapsed:.1f}s total")
+            if use_parallel:
+                print(f"  ({n_workers} workers, ~{written / elapsed:.1f} samples/s)")
+
+        return path.resolve()
+
+    # ------------------------------------------------------------------
+    # Sequential generation (n_workers=1)
+    # ------------------------------------------------------------------
+
+    def _generate_sequential(
+        self, f, ds_H, ds_S, ds_X0, ds_Xopt, ds_eps, ds_rate,
+        n_samples: int, eps_list: list[float], seed: int,
+        X0: np.ndarray, pbar,
+    ) -> None:
+        """Generate samples one at a time (original path)."""
+        from ..metrics.rate import sum_rate as _sum_rate
+
+        cfg = self.sys_config
+        optimizer = WaveformMatrixOptimizer(cfg, self.bnb_config)
+        written = 0
+
+        while written < n_samples:
+            cs = min(self.chunk_size, n_samples - written)
+
+            buf_H = np.empty((cs, cfg.K, cfg.N), dtype=np.complex128)
+            buf_S = np.empty((cs, cfg.K, cfg.L), dtype=np.complex128)
+            buf_X0 = np.empty((cs, cfg.N, cfg.L), dtype=np.complex128)
+            buf_Xopt = np.empty((cs, cfg.N, cfg.L), dtype=np.complex128)
+            buf_eps = np.empty(cs, dtype=np.float64)
+            buf_rate = np.empty(cs, dtype=np.float64)
+
+            for j in range(cs):
+                idx = written + j
+                np.random.seed(seed + idx)
+
+                H = generate_channel(cfg.K, cfg.N)
+                S = generate_symbols(cfg.K, cfg.L)
+                eps_val = eps_list[idx % len(eps_list)]
+
+                X_opt, _ = optimizer.optimize(H, S, X0, eps_val)
+                sr = _sum_rate(H, X_opt, S, cfg.N0)
+
+                buf_H[j] = H
+                buf_S[j] = S
+                buf_X0[j] = X0
+                buf_Xopt[j] = X_opt
+                buf_eps[j] = eps_val
+                buf_rate[j] = sr
+
+                pbar.update(1)
+
+            # Flush chunk to disk
+            new_len = written + cs
+            ds_H.resize(new_len, axis=0);    ds_H[written:new_len] = buf_H
+            ds_S.resize(new_len, axis=0);    ds_S[written:new_len] = buf_S
+            ds_X0.resize(new_len, axis=0);   ds_X0[written:new_len] = buf_X0
+            ds_Xopt.resize(new_len, axis=0); ds_Xopt[written:new_len] = buf_Xopt
+            ds_eps.resize(new_len, axis=0);  ds_eps[written:new_len] = buf_eps
+            ds_rate.resize(new_len, axis=0); ds_rate[written:new_len] = buf_rate
+
+            f.flush()
+            written = new_len
+
+    # ------------------------------------------------------------------
+    # Parallel generation (n_workers > 1)
+    # ------------------------------------------------------------------
+
+    def _generate_parallel(
+        self, f, ds_H, ds_S, ds_X0, ds_Xopt, ds_eps, ds_rate,
+        n_samples: int, eps_list: list[float], seed: int,
+        X0: np.ndarray, n_workers: int, pbar,
+    ) -> None:
+        """Generate samples across multiple processes.
+
+        Each chunk is dispatched to a pool.  Results are collected in
+        sample-index order and flushed to HDF5 when the chunk completes.
+        """
+        cfg = self.sys_config
+        written = 0
+
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
             while written < n_samples:
                 cs = min(self.chunk_size, n_samples - written)
 
+                # Build task arguments for this chunk
+                tasks = [
+                    (written + j, seed, eps_list[(written + j) % len(eps_list)],
+                     self.sys_config, self.bnb_config, X0)
+                    for j in range(cs)
+                ]
+
+                # Submit all tasks and collect as they complete
                 buf_H = np.empty((cs, cfg.K, cfg.N), dtype=np.complex128)
                 buf_S = np.empty((cs, cfg.K, cfg.L), dtype=np.complex128)
                 buf_X0 = np.empty((cs, cfg.N, cfg.L), dtype=np.complex128)
@@ -197,25 +366,23 @@ class NNDatasetGenerator:
                 buf_eps = np.empty(cs, dtype=np.float64)
                 buf_rate = np.empty(cs, dtype=np.float64)
 
-                for j in range(cs):
-                    idx = written + j
-                    np.random.seed(seed + idx)
+                futures = {
+                    pool.submit(_generate_one_sample, task): task[0] - written
+                    for task in tasks
+                }
 
-                    H = generate_channel(cfg.K, cfg.N)
-                    S = generate_symbols(cfg.K, cfg.L)
-                    eps_val = eps_list[idx % len(eps_list)]
-
-                    X_opt, _ = optimizer.optimize(H, S, X0, eps_val)
-                    sr = _sum_rate(H, X_opt, S, cfg.N0)
-
+                for future in as_completed(futures):
+                    j = futures[future]
+                    idx, H, S, X0_s, X_opt, eps_val, sr = future.result()
                     buf_H[j] = H
                     buf_S[j] = S
-                    buf_X0[j] = X0
+                    buf_X0[j] = X0_s
                     buf_Xopt[j] = X_opt
                     buf_eps[j] = eps_val
                     buf_rate[j] = sr
+                    pbar.update(1)
 
-                # --- Flush chunk to disk ---
+                # Flush chunk to disk
                 new_len = written + cs
                 ds_H.resize(new_len, axis=0);    ds_H[written:new_len] = buf_H
                 ds_S.resize(new_len, axis=0);    ds_S[written:new_len] = buf_S
@@ -224,18 +391,8 @@ class NNDatasetGenerator:
                 ds_eps.resize(new_len, axis=0);  ds_eps[written:new_len] = buf_eps
                 ds_rate.resize(new_len, axis=0); ds_rate[written:new_len] = buf_rate
 
-                f.flush()  # force write to OS
+                f.flush()
                 written = new_len
-
-                if verbose:
-                    elapsed = time.time() - t0
-                    rate_per_s = written / elapsed if elapsed > 0 else 0
-                    eta = (n_samples - written) / rate_per_s if rate_per_s > 0 else 0
-                    print(
-                        f"  [{written:>{len(str(n_samples))}}/{n_samples}] "
-                        f"flushed {cs} samples  "
-                        f"({elapsed:.1f}s elapsed, ~{eta:.0f}s remaining)"
-                    )
 
             # --- Finalize metadata ---
             meta.attrs["n_samples"] = written

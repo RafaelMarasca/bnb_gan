@@ -34,6 +34,7 @@ figures/*.png
 figures/*.eps
 datasets/*.h5
 nn_datasets/*.h5
+*.h5
 
 # Experiment results
 results/

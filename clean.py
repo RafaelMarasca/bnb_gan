@@ -21,9 +21,7 @@ ROOT = Path(__file__).resolve().parent
 
 # Directories to remove entirely
 DIRS_TO_REMOVE = [
-    "figures",
-    "datasets",
-    "nn_datasets",
+    "outputs",
     "dist",
     "build",
 ]

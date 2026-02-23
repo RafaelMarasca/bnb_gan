@@ -1,0 +1,69 @@
+# ============================================================
+# Quick Test — small system for fast iteration (< 30 seconds)
+# ============================================================
+# Usage:
+#   python main.py --config configs/quick.yaml --mode train
+# ============================================================
+
+name: quick_test
+output_dir: outputs
+seed: 42
+
+stages:
+  - convergence
+  - rate_sweep
+  - dataset
+  - gan_train
+  - waveform_eval
+  - plots
+  - report
+
+system:
+  N: 8
+  K: 2
+  L: 4
+  PT: 1.0
+  SNR_dB: 10.0
+
+bnb:
+  rule: ARS
+  lb_solver: gp
+  ub_solver: gp
+  tol: 0.01
+  max_iter: 20
+  gp_max_iter: 30
+
+convergence:
+  epsilon: 1.0
+
+rate_sweep:
+  epsilons: [0.3, 0.7, 1.0]
+  n_trials: 1
+  tol: 0.1
+  max_iter: 10
+
+dataset:
+  n_samples: 16
+  epsilons: [0.3, 0.7, 1.0]
+  chunk_size: 8
+  n_workers: 1              # keep sequential for tiny datasets
+
+gan:
+  latent_dim: 64
+  hidden_g: [128, 128]
+  hidden_c: [128, 64]
+  n_epochs: 10
+  batch_size: 8
+  learning_rate: 0.0001
+  n_critic: 5
+  lambda_gp: 10.0
+  eval_every: 1
+  save_every: 0
+
+eval:
+  n_samples: 4
+  epsilons: [0.3, 0.7, 1.0]
+
+plot:
+  formats: [png]
+  dpi: 150
