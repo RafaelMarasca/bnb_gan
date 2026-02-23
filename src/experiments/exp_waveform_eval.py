@@ -2,6 +2,8 @@
 Built-in Experiments — Waveform Evaluation
 ==========================================
 Compare BnB (optimal) vs GAN (generated) waveforms on fresh samples.
+
+One GAN checkpoint is loaded per epsilon value (trained separately).
 """
 
 from __future__ import annotations
@@ -22,12 +24,14 @@ class WaveformEvalExperiment(BaseExperiment):
     and outputs (X_bnb, X_gan, rates, power, similarity metrics, and
     execution times for both methods).
 
+    One GAN is loaded per epsilon value (each was trained independently).
+
     Config keys used
     ----------------
     - ``system.*`` (N, K, L, PT, SNR_dB)
     - ``bnb.*`` (solver settings)
     - ``eval.n_samples``, ``eval.epsilons``
-    - ``gan.*`` (for loading trained model)
+    - ``gan.*`` (for loading trained models)
     - ``seed``
     """
 
@@ -48,11 +52,20 @@ class WaveformEvalExperiment(BaseExperiment):
         sim_metric = WaveformSimilarityMetric()
         X0 = generate_chirp(cfg.system.N, cfg.system.L, cfg.system.PT)
 
-        # Try to load a trained GAN
-        trainer = self._load_gan_trainer()
-        gan_ok = trainer is not None
+        # Load one GAN trainer per epsilon
+        gan_trainers: dict[float, Any] = {}
+        for eps in cfg.eval.epsilons:
+            trainer = self._load_gan_trainer(eps)
+            if trainer is not None:
+                gan_trainers[eps] = trainer
+                if verbose:
+                    print(f"  GAN loaded for epsilon={eps}")
+            elif verbose:
+                print(f"  GAN NOT found for epsilon={eps}")
+
+        gan_ok = len(gan_trainers) > 0
         if verbose:
-            print(f"  GAN available: {gan_ok}")
+            print(f"  GANs available: {len(gan_trainers)}/{len(cfg.eval.epsilons)}")
 
         waveforms_dir = self.output_dir / "waveforms"
         waveforms_dir.mkdir(exist_ok=True)
@@ -92,9 +105,10 @@ class WaveformEvalExperiment(BaseExperiment):
             }
 
             # ── GAN ──────────────────────────────────────
-            if gan_ok:
+            trainer = gan_trainers.get(eps)
+            if trainer is not None:
                 t_gan_start = time.perf_counter()
-                X_gan = trainer.generate(H, S, X0, eps)
+                X_gan = trainer.generate(H, S, X0)
                 t_gan = time.perf_counter() - t_gan_start
 
                 rate_gan = sum_rate(H, X_gan, S, N0)
@@ -126,7 +140,7 @@ class WaveformEvalExperiment(BaseExperiment):
                     f"  [{i+1}/{cfg.eval.n_samples}]  "
                     f"\u03b5={eps:.2f}  BnB={rate_bnb:.3f} ({t_bnb:.3f}s)"
                 ]
-                if gan_ok:
+                if trainer is not None:
                     parts.append(
                         f"  GAN={rec['rate_gan']:.3f} ({t_gan:.4f}s)  "
                         f"ratio={rec['rate_ratio']:.3f}  "
@@ -185,9 +199,15 @@ class WaveformEvalExperiment(BaseExperiment):
 
     # ── Helpers ─────────────────────────────────────────
 
-    def _load_gan_trainer(self) -> Any:
-        """Try to rebuild a GAN trainer from a saved checkpoint."""
+    def _load_gan_trainer(self, epsilon: float) -> Any:
+        """Try to rebuild a GAN trainer from a saved checkpoint for a
+        specific epsilon value."""
+        eps_tag = f"eps_{epsilon:.4f}".replace(".", "p")
         search_dirs = [
+            self.output_dir.parent / "gan_train" / "checkpoints" / eps_tag,
+            Path(self.config.output_dir) / self.config.name / "stages" / "gan_train" / "checkpoints" / eps_tag,
+            Path(self.config.output_dir) / self.config.name / "experiments" / "gan_train" / "checkpoints" / eps_tag,
+            # Fallback: look for a single-model checkpoint dir (legacy)
             self.output_dir.parent / "gan_train" / "checkpoints",
             Path(self.config.output_dir) / self.config.name / "stages" / "gan_train" / "checkpoints",
             Path(self.config.output_dir) / self.config.name / "experiments" / "gan_train" / "checkpoints",
@@ -230,6 +250,7 @@ class WaveformEvalExperiment(BaseExperiment):
                 G, C, config=tcfg,
                 PT=cfg.system.PT,
                 N0=cfg.system.N0,
+                epsilon=epsilon,
                 device=device,
             )
             ckpts = sorted(ckpt_dir.glob("*.pt"))

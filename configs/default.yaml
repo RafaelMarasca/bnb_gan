@@ -53,9 +53,9 @@ rate_sweep:
 
 # ── Dataset Generation ───────────────────────────────────
 dataset:
-  n_samples: 50000
-  epsilons: [0.3, 0.7, 1.0]
-  chunk_size: 5000
+  n_samples: 500
+  epsilons: [1.0]
+  chunk_size: 500
   n_workers: 8              # 0 = all CPU cores, 1 = sequential
 
 # ── GAN (WGAN-GP) ────────────────────────────────────────
@@ -79,7 +79,7 @@ gan:
 # ── Evaluation (BnB vs GAN) ─────────────────────────────
 eval:
   n_samples: 5000
-  epsilons: [0.3, 0.7, 1.0]
+  epsilons: [1.0]
 
 # ── Plotting ─────────────────────────────────────────────
 plot:

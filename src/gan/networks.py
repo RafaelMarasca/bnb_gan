@@ -3,6 +3,9 @@ Generator & Critic Networks
 ============================
 Conditional WGAN-GP architectures for RadCom waveform generation.
 
+The condition vector contains (H, S, X0) but **not** epsilon — one GAN
+is trained per epsilon value.
+
 Generator
 ---------
 Maps condition vector + latent noise → waveform matrix X_opt.

@@ -394,17 +394,6 @@ class NNDatasetGenerator:
                 f.flush()
                 written = new_len
 
-            # --- Finalize metadata ---
-            meta.attrs["n_samples"] = written
-            meta.attrs["total_time_s"] = time.time() - t0
-
-        if verbose:
-            sz_mb = path.stat().st_size / (1024 * 1024)
-            print(f"\n  Dataset saved: {path.resolve()}")
-            print(f"  {written} samples, {sz_mb:.1f} MB, {time.time() - t0:.1f}s total")
-
-        return path.resolve()
-
 
 # =====================================================================
 # Lazy HDF5 Dataset (PyTorch-compatible)
@@ -517,4 +506,68 @@ class RadComHDF5Dataset:
             f"RadComHDF5Dataset(path='{self.path}', "
             f"n_samples={self._n}, "
             f"shapes={self.shape_info})"
+        )
+
+
+# =====================================================================
+# Epsilon-Filtered Dataset Wrapper
+# =====================================================================
+
+class EpsilonFilteredDataset:
+    """Subset of a ``RadComHDF5Dataset`` containing only samples with a
+    specific epsilon value.
+
+    This allows training one GAN per epsilon on a single mixed-epsilon
+    HDF5 file without duplicating data on disk.
+
+    Parameters
+    ----------
+    base_dataset : RadComHDF5Dataset
+        The full (multi-epsilon) dataset.
+    epsilon : float
+        Target epsilon value to keep.
+    atol : float
+        Absolute tolerance for floating-point comparison (default 1e-8).
+
+    Examples
+    --------
+    >>> ds = RadComHDF5Dataset("data.h5")
+    >>> ds_eps03 = EpsilonFilteredDataset(ds, epsilon=0.3)
+    >>> len(ds_eps03)
+    3333
+    >>> H, S, X0, X_opt, eps, rate = ds_eps03[0]
+    """
+
+    def __init__(
+        self,
+        base_dataset: RadComHDF5Dataset,
+        epsilon: float,
+        atol: float = 1e-8,
+    ) -> None:
+        self._ds = base_dataset
+        self.epsilon = epsilon
+        # Pre-compute the index mapping (read epsilon column once)
+        all_eps = np.array(base_dataset._epsilon[:])
+        self._indices = np.where(np.abs(all_eps - epsilon) < atol)[0]
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+    def __getitem__(self, idx: int):
+        if idx < 0:
+            idx += len(self._indices)
+        if idx < 0 or idx >= len(self._indices):
+            raise IndexError(
+                f"Index {idx} out of range for filtered dataset of size {len(self._indices)}"
+            )
+        return self._ds[int(self._indices[idx])]
+
+    def close(self) -> None:
+        """Delegate to the underlying dataset."""
+        self._ds.close()
+
+    def __repr__(self) -> str:
+        return (
+            f"EpsilonFilteredDataset(epsilon={self.epsilon}, "
+            f"n_samples={len(self)}, base={self._ds!r})"
         )

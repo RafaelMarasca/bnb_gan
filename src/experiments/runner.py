@@ -258,9 +258,9 @@ class ExperimentRunner:
     # =================================================================
 
     def run_gan_train(self, verbose: bool = True):
-        """Train WGAN-GP on the generated dataset."""
+        """Train one WGAN-GP per epsilon on the generated dataset."""
         import torch
-        from ..data.nn_dataset import RadComHDF5Dataset
+        from ..data.nn_dataset import RadComHDF5Dataset, EpsilonFilteredDataset
         from ..gan import Generator, Critic, WGANGPTrainer, TrainerConfig
 
         # Locate dataset
@@ -273,65 +273,87 @@ class ExperimentRunner:
         if verbose:
             print(f"  Dataset: {ds_path}")
 
-        dataset = RadComHDF5Dataset(ds_path)
+        base_dataset = RadComHDF5Dataset(ds_path)
         cfg = self.cfg
-
-        # Build networks
-        G = Generator(
-            cfg.N, cfg.K, cfg.L, cfg.PT,
-            latent_dim=cfg.gan_latent_dim,
-            hidden_dims=tuple(cfg.gan_hidden_g),
-        )
-        C = Critic(
-            cfg.N, cfg.K, cfg.L,
-            hidden_dims=tuple(cfg.gan_hidden_c),
-        )
-
-        ckpt_dir = str(self.stages_dir / "gan_train" / "checkpoints")
-        tcfg = TrainerConfig(
-            n_epochs=cfg.gan_n_epochs,
-            batch_size=cfg.gan_batch_size,
-            lr_gen=cfg.gan_lr, lr_critic=cfg.gan_lr,
-            n_critic=cfg.gan_n_critic,
-            lambda_gp=cfg.gan_lambda_gp,
-            latent_dim=cfg.gan_latent_dim,
-            eval_every=cfg.gan_eval_every,
-            save_every=cfg.gan_save_every,
-            checkpoint_dir=ckpt_dir,
-        )
-
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        trainer = WGANGPTrainer(
-            G, C, config=tcfg,
-            PT=cfg.PT, N0=cfg.sys_config.N0,
-            device=device,
-        )
 
-        if verbose:
-            print(f"  Device:    {device}")
-            print(f"  Generator: {sum(p.numel() for p in G.parameters()):,} params")
-            print(f"  Critic:    {sum(p.numel() for p in C.parameters()):,} params")
+        epsilons = cfg.ds_epsilons
+        all_histories = {}
 
-        history = trainer.train(dataset, verbose=verbose)
-        self._gan_trainer = trainer
-        self._gan_history = history
+        for eps in epsilons:
+            if verbose:
+                print(f"\n{'='*60}")
+                print(f"  Training GAN for epsilon = {eps}")
+                print(f"{'='*60}")
 
-        # ── Persist ──────────────────────────────────────────
+            filtered = EpsilonFilteredDataset(base_dataset, epsilon=eps)
+            if len(filtered) == 0:
+                if verbose:
+                    print(f"  WARNING: No samples for epsilon={eps}, skipping.")
+                continue
+            if verbose:
+                print(f"  Filtered dataset: {len(filtered)} samples")
+
+            G = Generator(
+                cfg.N, cfg.K, cfg.L, cfg.PT,
+                latent_dim=cfg.gan_latent_dim,
+                hidden_dims=tuple(cfg.gan_hidden_g),
+            )
+            C = Critic(
+                cfg.N, cfg.K, cfg.L,
+                hidden_dims=tuple(cfg.gan_hidden_c),
+            )
+
+            eps_tag = f"eps_{eps:.4f}".replace(".", "p")
+            ckpt_dir = str(self.stages_dir / "gan_train" / "checkpoints" / eps_tag)
+            tcfg = TrainerConfig(
+                n_epochs=cfg.gan_n_epochs,
+                batch_size=cfg.gan_batch_size,
+                lr_gen=cfg.gan_lr, lr_critic=cfg.gan_lr,
+                n_critic=cfg.gan_n_critic,
+                lambda_gp=cfg.gan_lambda_gp,
+                latent_dim=cfg.gan_latent_dim,
+                eval_every=cfg.gan_eval_every,
+                save_every=cfg.gan_save_every,
+                checkpoint_dir=ckpt_dir,
+            )
+
+            trainer = WGANGPTrainer(
+                G, C, config=tcfg,
+                PT=cfg.PT, N0=cfg.sys_config.N0,
+                epsilon=eps,
+                device=device,
+            )
+
+            if verbose:
+                print(f"  Device:    {device}")
+                print(f"  Generator: {sum(p.numel() for p in G.parameters()):,} params")
+                print(f"  Critic:    {sum(p.numel() for p in C.parameters()):,} params")
+
+            history = trainer.train(filtered, verbose=verbose)
+            all_histories[eps] = history
+
+            # Persist per-epsilon
+            gan_dir = self.stages_dir / "gan_train"
+            gan_dir.mkdir(exist_ok=True)
+            history.save(gan_dir / f"history_{eps_tag}.json")
+            trainer.save_checkpoint(cfg.gan_n_epochs - 1)
+
+        self._gan_trainer = None  # no single trainer anymore
+        self._gan_history = all_histories
+
+        # ── Persist summary ──────────────────────────────────
         gan_dir = self.stages_dir / "gan_train"
         gan_dir.mkdir(exist_ok=True)
-        history.save(gan_dir / "history.json")
-        trainer.save_checkpoint(cfg.gan_n_epochs - 1)
-
         _save_json({
             "n_epochs": cfg.gan_n_epochs,
             "device": device,
             "dataset": str(ds_path),
-            "g_params": sum(p.numel() for p in G.parameters()),
-            "c_params": sum(p.numel() for p in C.parameters()),
+            "epsilons_trained": epsilons,
         }, gan_dir / "summary.json")
 
-        dataset.close()
-        return history
+        base_dataset.close()
+        return all_histories
 
     # =================================================================
     # Stage 5 — Waveform Evaluation
@@ -358,11 +380,15 @@ class ExperimentRunner:
         sim_metric = WaveformSimilarityMetric()
         X0 = generate_chirp(cfg.N, cfg.L, cfg.PT)
 
-        # Try to get a GAN generator
-        trainer = self._gan_trainer or self._load_gan_trainer()
-        gan_ok = trainer is not None
+        # Try to get a GAN generator for each epsilon
+        gan_trainers: dict[float, Any] = {}
+        for eps_val in cfg.eval_epsilons:
+            t = self._load_gan_trainer(eps_val)
+            if t is not None:
+                gan_trainers[eps_val] = t
+        gan_ok = len(gan_trainers) > 0
         if verbose:
-            print(f"  GAN available: {gan_ok}")
+            print(f"  GANs available: {len(gan_trainers)}/{len(cfg.eval_epsilons)}")
 
         records: list[dict] = []
 
@@ -395,8 +421,9 @@ class ExperimentRunner:
             }
 
             # ── GAN ──────────────────────────────────────────
-            if gan_ok:
-                X_gan = trainer.generate(H, S, X0, eps)
+            trainer = gan_trainers.get(eps)
+            if trainer is not None:
+                X_gan = trainer.generate(H, S, X0)
                 rate_gan = sum_rate(H, X_gan, S, N0)
                 sim_gan = sim_metric.compute(x=X_gan, x0=X0, epsilon=eps)
                 power_gan = np.sum(np.abs(X_gan) ** 2, axis=0)
@@ -424,7 +451,7 @@ class ExperimentRunner:
                     f"  [{i+1}/{cfg.eval_n_samples}]  "
                     f"\u03b5={eps:.2f}  BnB={rate_bnb:.3f}"
                 ]
-                if gan_ok:
+                if trainer is not None:
                     parts.append(
                         f"  GAN={rate_gan:.3f}  "
                         f"ratio={rec['rate_ratio']:.3f}"
@@ -438,8 +465,8 @@ class ExperimentRunner:
         if verbose and records:
             rb = [r["rate_bnb"] for r in records]
             print(f"\n  BnB rate: mean={np.mean(rb):.3f}")
-            if gan_ok:
-                ratios = [r["rate_ratio"] for r in records]
+            if any("rate_ratio" in r for r in records):
+                ratios = [r["rate_ratio"] for r in records if "rate_ratio" in r]
                 print(
                     f"  GAN/BnB ratio: mean={np.mean(ratios):.3f}, "
                     f"min={np.min(ratios):.3f}, max={np.max(ratios):.3f}"
@@ -549,10 +576,23 @@ class ExperimentRunner:
                     return h5s[-1]
         return None
 
-    def _load_gan_trainer(self):
-        """Try to rebuild the GAN trainer from a saved checkpoint."""
-        ckpt_dir = self.stages_dir / "gan_train" / "checkpoints"
-        if not ckpt_dir.exists():
+    def _load_gan_trainer(self, epsilon: float = 1.0):
+        """Try to rebuild a GAN trainer from a saved checkpoint for a specific epsilon."""
+        eps_tag = f"eps_{epsilon:.4f}".replace(".", "p")
+        candidates = [
+            self.stages_dir / "gan_train" / "checkpoints" / eps_tag,
+            # Fallback: legacy flat checkpoint dir
+            self.stages_dir / "gan_train" / "checkpoints",
+        ]
+        ckpt_dir = None
+        for d in candidates:
+            if d.exists():
+                ckpts = sorted(d.glob("*.pt"))
+                if ckpts:
+                    ckpt_dir = d
+                    break
+
+        if ckpt_dir is None:
             return None
         ckpts = sorted(ckpt_dir.glob("*.pt"))
         if not ckpts:
@@ -585,6 +625,7 @@ class ExperimentRunner:
             trainer = WGANGPTrainer(
                 G, C, config=tcfg,
                 PT=cfg.PT, N0=cfg.sys_config.N0,
+                epsilon=epsilon,
                 device=device,
             )
             trainer.load_checkpoint(ckpts[-1])
@@ -646,11 +687,26 @@ class ExperimentRunner:
         )
 
     def _load_gan_history(self):
-        """Load training history from disk."""
-        p = self.stages_dir / "gan_train" / "history.json"
+        """Load training history from disk.
+
+        Returns a single ``TrainingHistory`` (first found) or a dict
+        mapping epsilon → history if multiple per-epsilon files exist.
+        Falls back to legacy ``history.json`` for backward compatibility.
+        """
+        from ..gan.history import TrainingHistory
+
+        gan_dir = self.stages_dir / "gan_train"
+        # Try per-epsilon histories
+        per_eps = sorted(gan_dir.glob("history_eps_*.json"))
+        if per_eps:
+            # For the GAN dashboard, merge or return the first one
+            # (dashboard currently expects a single history)
+            return TrainingHistory.load(per_eps[0])
+
+        # Legacy single-history fallback
+        p = gan_dir / "history.json"
         if not p.exists():
             return None
-        from ..gan.history import TrainingHistory
         return TrainingHistory.load(p)
 
     def _load_waveform_summary(self) -> list[dict] | None:

@@ -51,7 +51,11 @@ from .utils import complex_to_real, real_to_complex, flatten_condition
 # =====================================================================
 
 class _ConditionedDataset(Dataset):
-    """Wraps ``RadComHDF5Dataset`` to return (condition, X_real, epsilon, rate)."""
+    """Wraps ``RadComHDF5Dataset`` to return (condition, X_real, X0_real, rate).
+
+    Epsilon is **not** part of the condition vector — one GAN is trained
+    per epsilon value.
+    """
 
     def __init__(self, hdf5_dataset) -> None:
         self._ds = hdf5_dataset
@@ -61,10 +65,10 @@ class _ConditionedDataset(Dataset):
 
     def __getitem__(self, idx: int):
         H, S, X0, X_opt, eps, rate = self._ds[idx]
-        cond = flatten_condition(H, S, X0, eps)
+        cond = flatten_condition(H, S, X0)
         X_real = complex_to_real(X_opt)  # (N, L, 2)
         X0_real = complex_to_real(X0)    # (N, L, 2)
-        return cond, X_real, X0_real, torch.tensor(eps, dtype=torch.float32), torch.tensor(rate, dtype=torch.float32)
+        return cond, X_real, X0_real, torch.tensor(rate, dtype=torch.float32)
 
 
 # =====================================================================
@@ -143,12 +147,14 @@ class WGANGPTrainer:
         config: TrainerConfig | None = None,
         PT: float = 1.0,
         N0: float = 0.1,
+        epsilon: float = 1.0,
         device: str = "cpu",
     ) -> None:
         self.cfg = config or TrainerConfig()
         self.device = torch.device(device)
         self.PT = PT
         self.N0 = N0
+        self.epsilon = epsilon
 
         self.G = generator.to(self.device)
         self.C = critic.to(self.device)
@@ -198,7 +204,6 @@ class WGANGPTrainer:
         X_fake: Tensor,
         X0_real: Tensor,
         cond: Tensor,
-        eps_batch: Tensor,
         H_batch: np.ndarray | None = None,
         S_batch: np.ndarray | None = None,
         X_opt_batch: np.ndarray | None = None,
@@ -214,7 +219,7 @@ class WGANGPTrainer:
         # Similarity: ‖X_fake − X0‖_F / (√(N·L) · ε)
         diff = X_fake - X0_real
         fro_norm = diff.reshape(diff.size(0), -1).norm(2, dim=1)  # (batch,)
-        eps_safe = eps_batch.clamp(min=1e-8)
+        eps_safe = max(self.epsilon, 1e-8)
         ratio = (fro_norm / (math.sqrt(N * L) * eps_safe)).mean().item()
 
         return {"power_violation": power_viol, "similarity_violation": ratio}
@@ -253,6 +258,8 @@ class WGANGPTrainer:
 
         t0 = time.time()
         total_critic_steps = 0
+        last_rate_real = float("nan")
+        last_rate_fake = float("nan")
 
         epoch_pbar = tqdm(
             range(self.cfg.n_epochs),
@@ -282,11 +289,10 @@ class WGANGPTrainer:
                 leave=False,
                 disable=not verbose,
             )
-            for batch_idx, (cond, X_real, X0_real, eps_batch, rate_batch) in enumerate(batch_pbar):
+            for batch_idx, (cond, X_real, X0_real, rate_batch) in enumerate(batch_pbar):
                 cond = cond.to(self.device)
                 X_real = X_real.to(self.device)
                 X0_real = X0_real.to(self.device)
-                eps_batch = eps_batch.to(self.device)
                 bs = cond.size(0)
 
                 # ======================================
@@ -338,7 +344,7 @@ class WGANGPTrainer:
                         z_eval = torch.randn(bs, self.cfg.latent_dim, device=self.device)
                         X_fake_eval = self.G(cond, z_eval)
                     metrics = self._physics_metrics(
-                        X_fake_eval, X0_real, cond, eps_batch,
+                        X_fake_eval, X0_real, cond,
                     )
                     ep_power_viol += metrics["power_violation"]
                     ep_sim_viol += metrics["similarity_violation"]
@@ -363,13 +369,18 @@ class WGANGPTrainer:
             }
             self.history.record(**record)
 
+            # Track last known rate values for display on non-eval epochs
+            if has_physics:
+                last_rate_real = record["rate_real"]
+                last_rate_fake = record["rate_fake"]
+
             # Update epoch progress bar postfix with key metrics
             epoch_pbar.set_postfix({
                 "C": f"{record['critic_loss']:+.3f}",
                 "G": f"{record['generator_loss']:+.3f}",
                 "W": f"{record['wasserstein_dist']:.3f}",
-                "r_real": f"{record['rate_real']:.2f}",
-                "r_fake": f"{record['rate_fake']:.2f}",
+                "r_real": f"{last_rate_real:.2f}",
+                "r_fake": f"{last_rate_fake:.2f}",
             })
 
             # --- Checkpoint ---
@@ -426,6 +437,7 @@ class WGANGPTrainer:
         path = ckpt_dir / f"wgan_epoch_{epoch:04d}.pt"
         torch.save({
             "epoch": epoch,
+            "epsilon": self.epsilon,
             "generator_state": self.G.state_dict(),
             "critic_state": self.C.state_dict(),
             "opt_G_state": self.opt_G.state_dict(),
@@ -443,6 +455,8 @@ class WGANGPTrainer:
         self.opt_G.load_state_dict(ckpt["opt_G_state"])
         self.opt_C.load_state_dict(ckpt["opt_C_state"])
         self.history = TrainingHistory(records=ckpt.get("history", []))
+        if "epsilon" in ckpt:
+            self.epsilon = ckpt["epsilon"]
         return ckpt["epoch"]
 
     @torch.no_grad()
@@ -451,17 +465,18 @@ class WGANGPTrainer:
         H: np.ndarray,
         S: np.ndarray,
         X0: np.ndarray,
-        epsilon: float,
         n_samples: int = 1,
     ) -> np.ndarray:
         """Generate waveform(s) using the trained generator.
+
+        Epsilon is not a network input — this trainer was trained for a
+        specific epsilon value (``self.epsilon``).
 
         Parameters
         ----------
         H : (K, N) complex
         S : (K, L) complex
         X0 : (N, L) complex
-        epsilon : float
         n_samples : int
             Number of independent waveform realisations to draw.
 
@@ -470,7 +485,7 @@ class WGANGPTrainer:
         ndarray (n_samples, N, L) complex   (or (N, L) if n_samples=1)
         """
         self.G.eval()
-        cond = flatten_condition(H, S, X0, epsilon).to(self.device)
+        cond = flatten_condition(H, S, X0).to(self.device)
         cond = cond.unsqueeze(0).expand(n_samples, -1)  # (n, cond_dim)
         z = torch.randn(n_samples, self.cfg.latent_dim, device=self.device)
         X_fake = self.G(cond, z)  # (n, N, L, 2)

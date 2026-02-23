@@ -1,0 +1,7 @@
+{
+  "dataset_path": "D:\\bnb_gan\\outputs\\default\\experiments\\dataset\\nn_datasets\\radcom_N16_K4_L20_50samples_20260223_182313.h5",
+  "n_samples": 50,
+  "epsilons": [
+    1.0
+  ]
+}

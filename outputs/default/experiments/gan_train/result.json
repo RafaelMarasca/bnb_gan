@@ -1,0 +1,10 @@
+{
+  "n_epochs": 200,
+  "device": "cuda",
+  "dataset": "outputs\\default\\experiments\\dataset\\nn_datasets\\radcom_N16_K4_L20_50samples_20260223_182313.h5",
+  "epsilons_trained": [
+    1.0
+  ],
+  "g_params": 1397888,
+  "c_params": 969473
+}

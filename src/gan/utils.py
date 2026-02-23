@@ -51,28 +51,30 @@ def flatten_condition(
     H: NDArray,
     S: NDArray,
     X0: NDArray,
-    epsilon: float,
 ) -> Tensor:
     """Flatten and concatenate the conditioning inputs into a single vector.
+
+    Epsilon is **not** included — train one GAN per epsilon instead.
 
     Parameters
     ----------
     H : ndarray (K, N) complex
     S : ndarray (K, L) complex
     X0 : ndarray (N, L) complex
-    epsilon : float
 
     Returns
     -------
-    Tensor, float32, shape ``(2*K*N + 2*K*L + 2*N*L + 1,)``
+    Tensor, float32, shape ``(2*K*N + 2*K*L + 2*N*L,)``
     """
     h_flat = complex_to_real(H).reshape(-1)
     s_flat = complex_to_real(S).reshape(-1)
     x0_flat = complex_to_real(X0).reshape(-1)
-    eps_t = torch.tensor([epsilon], dtype=torch.float32)
-    return torch.cat([h_flat, s_flat, x0_flat, eps_t])
+    return torch.cat([h_flat, s_flat, x0_flat])
 
 
 def condition_dim(N: int, K: int, L: int) -> int:
-    """Return the total condition vector dimension for given system sizes."""
-    return 2 * K * N + 2 * K * L + 2 * N * L + 1
+    """Return the total condition vector dimension for given system sizes.
+
+    Epsilon is excluded — one GAN is trained per epsilon value.
+    """
+    return 2 * K * N + 2 * K * L + 2 * N * L
